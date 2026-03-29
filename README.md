@@ -1,3 +1,14 @@
+---
+title: Support Triage Env
+emoji: 🎫
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+tags:
+  - openenv
+pinned: false
+---
 # 🎫 Support Triage Environment
 
 An OpenEnv-compatible reinforcement learning environment that simulates **real-world customer support ticket triage** — the process of classifying, routing, and responding to incoming support requests. Designed for training and evaluating AI agents on a task humans perform every day in every SaaS company.
