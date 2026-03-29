@@ -5,12 +5,13 @@
 FastAPI application exposing the OpenEnv interface over HTTP and WebSocket.
 
 Endpoints:
-  POST /reset          — Start a new episode
-  POST /step           — Execute an action
-  GET  /state          — Get current episode state
-  GET  /health         — Health check for container orchestration
-  GET  /metadata       — Environment metadata
-  WS   /ws             — WebSocket for persistent sessions
+  GET  /             — Root (status check for HF Spaces)
+  POST /reset        — Start a new episode
+  POST /step         — Execute an action
+  GET  /state        — Get current episode state
+  GET  /health       — Health check for container orchestration
+  GET  /metadata     — Environment metadata
+  WS   /ws           — WebSocket for persistent sessions
 
 Each WebSocket connection gets its own environment instance (session isolation).
 HTTP endpoints use a default shared instance for simplicity.
@@ -23,9 +24,9 @@ import json
 import traceback
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -111,6 +112,17 @@ app.add_middleware(
 # HTTP Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
 
+@app.get("/")
+async def root():
+    """Root endpoint for HF Spaces status check."""
+    return {
+        "name": "support_triage_env",
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": ["/reset", "/step", "/state", "/health", "/metadata"],
+    }
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health():
     """Health check endpoint for container orchestration."""
@@ -124,19 +136,33 @@ async def metadata():
 
 
 @app.post("/reset")
-async def reset(request: ResetRequest):
+async def reset(request: Request):
     """
     Reset the environment and start a new episode.
+
+    Accepts optional JSON body with task_id and seed.
+    If no body is provided, defaults to task_1 with seed=42.
 
     Returns the initial observation with the first ticket.
     """
     try:
-        obs = _default_env.reset(
-            task_id=request.task_id,
-            seed=request.seed,
-        )
+        # Parse body — accept empty POST, partial JSON, or full JSON
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+        task_id = body.get("task_id", "task_1") if isinstance(body, dict) else "task_1"
+        seed = body.get("seed", 42) if isinstance(body, dict) else 42
+
+        obs = _default_env.reset(task_id=str(task_id), seed=int(seed))
+        obs_dict = obs.model_dump()
+
+        # Return observation at top level (OpenEnv spec format)
+        # Also include observation/reward/done/info for backward compat
         return JSONResponse(content={
-            "observation": obs.model_dump(),
+            **obs_dict,
+            "observation": obs_dict,
             "reward": obs.reward,
             "done": obs.done,
             "info": obs.metadata,
@@ -149,16 +175,34 @@ async def reset(request: ResetRequest):
 
 
 @app.post("/step")
-async def step(request: StepRequest):
+async def step(request: Request):
     """
     Execute an action on the current ticket.
 
     Returns the next observation with reward and feedback.
     """
     try:
-        obs = _default_env.step(action=request.action)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Request body must be JSON with an 'action' field."},
+            )
+
+        # Accept both {"action": {...}} and direct action fields
+        if "action" in body and isinstance(body["action"], dict):
+            action_data = body["action"]
+        else:
+            action_data = body
+
+        action = TriageAction(**action_data)
+        obs = _default_env.step(action=action)
+        obs_dict = obs.model_dump()
+
         return JSONResponse(content={
-            "observation": obs.model_dump(),
+            **obs_dict,
+            "observation": obs_dict,
             "reward": obs.reward,
             "done": obs.done,
             "info": obs.metadata,
@@ -220,9 +264,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 seed = msg.get("seed", 42)
                 try:
                     obs = env.reset(task_id=task_id, seed=seed)
+                    obs_dict = obs.model_dump()
                     await websocket.send_json({
                         "type": "reset_result",
-                        "observation": obs.model_dump(),
+                        **obs_dict,
+                        "observation": obs_dict,
                         "reward": obs.reward,
                         "done": obs.done,
                         "info": obs.metadata,
@@ -238,9 +284,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 try:
                     action = TriageAction(**action_data)
                     obs = env.step(action=action)
+                    obs_dict = obs.model_dump()
                     await websocket.send_json({
                         "type": "step_result",
-                        "observation": obs.model_dump(),
+                        **obs_dict,
+                        "observation": obs_dict,
                         "reward": obs.reward,
                         "done": obs.done,
                         "info": obs.metadata,
