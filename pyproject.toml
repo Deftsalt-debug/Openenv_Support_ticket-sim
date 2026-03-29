@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "support-triage-env"
+version = "1.0.0"
+description = "OpenEnv-compatible customer support ticket triage environment for AI agent training"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+keywords = ["openenv", "reinforcement-learning", "ai-agents", "customer-support", "triage"]
+
+dependencies = [
+    "fastapi>=0.109.0,<1.0.0",
+    "uvicorn[standard]>=0.27.0,<1.0.0",
+    "pydantic>=2.5.0,<3.0.0",
+    "websockets>=12.0,<14.0",
+    "requests>=2.31.0,<3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.26.0",
+]
+baseline = [
+    "openai>=1.10.0",
+]
+all = [
+    "support-triage-env[dev,baseline]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "data*", "tasks*", "server*", "client*", "baseline*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

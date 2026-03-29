@@ -1,0 +1,62 @@
+# OpenEnv Environment Specification
+# https://github.com/meta-pytorch/OpenEnv
+
+name: support_triage_env
+version: "1.0.0"
+description: >
+  Customer support ticket triage environment for training AI agents.
+  Agents classify priority, categorize issues, detect sentiment, route
+  to teams, draft responses, and make escalation decisions across 3
+  difficulty levels with 16 realistic ticket scenarios.
+
+author: "OpenEnv Community"
+license: "BSD-3-Clause"
+
+# Environment interface types
+action_type: "models.TriageAction"
+observation_type: "models.TriageObservation"
+state_type: "models.TriageState"
+
+# Server configuration
+server:
+  entrypoint: "server.app:app"
+  port: 8000
+  health_endpoint: "/health"
+
+# Task definitions
+tasks:
+  - id: task_1
+    title: "Priority Classification"
+    difficulty: easy
+    description: "Classify ticket priority (P0–P3) based on severity signals."
+    num_tickets: 5
+    evaluated_fields: ["priority"]
+
+  - id: task_2
+    title: "Multi-Label Triage"
+    difficulty: medium
+    description: "Full triage: priority + category + sentiment + team routing."
+    num_tickets: 8
+    evaluated_fields: ["priority", "category", "sentiment", "assigned_team"]
+
+  - id: task_3
+    title: "Full Triage with Response Drafting"
+    difficulty: hard
+    description: "Complete triage with draft response and escalation decisions."
+    num_tickets: 10
+    evaluated_fields: ["priority", "category", "sentiment", "assigned_team", "decision", "draft_response", "escalation_reason"]
+
+# Deployment
+deployment:
+  type: docker
+  dockerfile: "server/Dockerfile"
+  base_image: "python:3.11-slim"
+
+# Tags for HF Hub discovery
+tags:
+  - openenv
+  - customer-support
+  - triage
+  - classification
+  - nlp
+  - real-world
