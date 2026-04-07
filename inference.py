@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Baseline inference script for Support Triage Environment.
-Follows the OpenEnv Hackathon x Scaler School of Technology required format.
+Inference Script — Support Triage Environment
+===================================
+MANDATORY
+- Environment variables:
+    API_BASE_URL   The API endpoint for the LLM.
+    MODEL_NAME     The model identifier to use for inference.
+    HF_TOKEN       Your Hugging Face / API key.
+    LOCAL_IMAGE_NAME (optional) The name of the local Docker image.
 
-Required env vars:
-    API_BASE_URL  — The API endpoint for the LLM
-    MODEL_NAME    — The model identifier to use for inference
-    HF_TOKEN      — Your Hugging Face / API key
-
-Emits structured stdout logs: [START], [STEP], [END]
+STDOUT FORMAT
+    [START] task=<task_name> env=<benchmark> model=<model_name>
+    [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+    [END]   success=<true|false> steps=<n> score=<score> rewards=<r1,r2,...,rn>
 """
 
 from __future__ import annotations
@@ -17,8 +21,8 @@ import json
 import os
 import re
 import sys
-import time
-from typing import Any, Dict, List
+import textwrap
+from typing import Any, Dict, List, Optional
 
 # Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -41,36 +45,58 @@ from client import SupportTriageClient
 # Configuration from environment variables
 # ─────────────────────────────────────────────────────────────────────────────
 
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+API_BASE_URL = os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1"
+MODEL_NAME = os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-72B-Instruct"
 HF_TOKEN = os.getenv("HF_TOKEN")
-
-# Optional — for from_docker_image() usage
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
+
+BENCHMARK = "support_triage_env"
+MAX_TOKENS = 500
+TEMPERATURE = 0.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI client configured via the required variables
+# OpenAI client
 # ─────────────────────────────────────────────────────────────────────────────
 
 client = OpenAI(
     base_url=API_BASE_URL,
-    api_key=HF_TOKEN or "dummy-key",
+    api_key=API_KEY or "dummy-key",
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured logging helpers (exact format from sample)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Prompt construction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_system_prompt(task_instructions: str) -> str:
-    return f"""You are an AI agent performing customer support ticket triage.
-
-{task_instructions}
-
-RESPONSE FORMAT:
-You MUST respond with a valid JSON object containing your triage action.
-Do NOT include any other text, markdown, or explanation — ONLY the JSON object.
+SYSTEM_PROMPT = textwrap.dedent("""
+You are an AI agent performing customer support ticket triage.
+Read each ticket carefully and respond with ONLY a valid JSON object.
 
 Valid enum values:
 - priority: P0_CRITICAL, P1_HIGH, P2_MEDIUM, P3_LOW
@@ -79,34 +105,35 @@ Valid enum values:
 - assigned_team: BILLING_OPS, ENGINEERING, ACCOUNT_MGMT, PRODUCT, SECURITY_TEAM, CUSTOMER_SUCCESS, TIER1_SUPPORT
 - decision: RESPOND, ESCALATE, AUTO_RESOLVE
 
-Example (Task 1):
-{{"priority": "P1_HIGH"}}
-
-Example (Task 2):
-{{"priority": "P1_HIGH", "category": "TECHNICAL", "sentiment": "FRUSTRATED", "assigned_team": "ENGINEERING"}}
-
-Example (Task 3):
-{{"priority": "P1_HIGH", "category": "TECHNICAL", "sentiment": "FRUSTRATED", "assigned_team": "ENGINEERING", "decision": "ESCALATE", "draft_response": "Hi Sam, I understand this is critically impacting your business. I'm escalating this to our engineering team immediately. You'll receive an update within 30 minutes.", "escalation_reason": "Payment processing outage with significant revenue impact"}}
-"""
+Respond with ONLY a JSON object — no markdown, no explanation.
+""").strip()
 
 
 def build_ticket_prompt(obs: TriageObservation) -> str:
     ticket = obs.ticket
     if not ticket:
         return "No ticket available."
-    return f"""TICKET TO TRIAGE:
+
+    task_hint = ""
+    if obs.task_id == "task_1":
+        task_hint = 'Set only "priority". Example: {"priority": "P1_HIGH"}'
+    elif obs.task_id == "task_2":
+        task_hint = 'Set "priority", "category", "sentiment", "assigned_team".'
+    else:
+        task_hint = 'Set all fields: "priority", "category", "sentiment", "assigned_team", "decision", "draft_response" (50-300 chars addressing customer by name), and "escalation_reason" if escalating.'
+
+    return f"""{obs.task_instructions}
+
+TICKET:
 ID: {ticket.ticket_id}
 Subject: {ticket.subject}
 From: {ticket.customer_name} ({ticket.customer_tier} tier)
-Channel: {ticket.channel}
-Timestamp: {ticket.timestamp}
-Previous Tickets: {ticket.previous_tickets}
-Account Age: {ticket.account_age_days} days
-Attachments: {"Yes" if ticket.has_attachments else "No"}
+Channel: {ticket.channel} | Previous tickets: {ticket.previous_tickets} | Account age: {ticket.account_age_days} days
 
 {ticket.body}
 
-Respond with ONLY a JSON object. Tickets remaining: {obs.tickets_remaining}"""
+{task_hint}
+Respond with ONLY a JSON object."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -125,7 +152,7 @@ def parse_llm_response(response_text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try:
                 return json.loads(match.group())
@@ -157,103 +184,84 @@ def dict_to_action(data: Dict[str, Any]) -> TriageAction:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main inference loop with structured [START]/[STEP]/[END] logging
+# Main
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Initialize environment client (local mode — runs in-process)
     env_client = SupportTriageClient.local()
 
     tasks = ["task_1", "task_2", "task_3"]
     seed = 42
-    all_results = []
 
     for task_id in tasks:
-        # Reset environment
-        obs = env_client.reset(task_id=task_id, seed=seed)
-        system_prompt = build_system_prompt(obs.task_instructions)
+        rewards: List[float] = []
+        steps_taken = 0
+        score = 0.0
+        success = False
 
-        # [START] log
-        print(f"[START] task_id={task_id} seed={seed}")
+        log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
-        step_num = 0
-        step_rewards: List[float] = []
+        try:
+            obs = env_client.reset(task_id=task_id, seed=seed)
 
-        while not obs.done:
-            step_num += 1
-            ticket_prompt = build_ticket_prompt(obs)
+            step = 0
+            while not obs.done:
+                step += 1
+                ticket_prompt = build_ticket_prompt(obs)
 
-            # Call LLM via OpenAI client
-            try:
-                completion = client.chat.completions.create(
-                    model=MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": ticket_prompt},
-                    ],
-                    temperature=0.0,
-                    max_tokens=500,
+                # Call LLM via OpenAI client
+                error_msg = None
+                try:
+                    completion = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": ticket_prompt},
+                        ],
+                        temperature=TEMPERATURE,
+                        max_tokens=MAX_TOKENS,
+                        stream=False,
+                    )
+                    response_text = (completion.choices[0].message.content or "").strip()
+                except Exception as exc:
+                    error_msg = str(exc)
+                    response_text = "{}"
+
+                # Parse and step
+                parsed = parse_llm_response(response_text)
+                action = dict_to_action(parsed)
+                action_str = json.dumps(action.model_dump(exclude_none=True))
+
+                obs = env_client.step(action)
+
+                reward = obs.reward or 0.0
+                done = obs.done
+                rewards.append(reward)
+                steps_taken = step
+
+                log_step(
+                    step=step,
+                    action=action_str,
+                    reward=reward,
+                    done=done,
+                    error=error_msg,
                 )
-                response_text = completion.choices[0].message.content or ""
-            except Exception as e:
-                print(f"[STEP] step={step_num} error=\"{e}\"")
-                response_text = "{}"
 
-            # Parse response and step
-            parsed = parse_llm_response(response_text)
-            action = dict_to_action(parsed)
-            obs = env_client.step(action)
+                if done:
+                    break
 
-            reward = obs.reward or 0.0
-            step_rewards.append(reward)
+            # Compute score in [0, 1]
+            score = sum(rewards) / len(rewards) if rewards else 0.0
+            score = min(max(score, 0.0), 1.0)
+            success = score > 0.0
 
-            # [STEP] log
-            action_dict = action.model_dump(exclude_none=True)
-            print(
-                f"[STEP] task_id={task_id} step={step_num} "
-                f"reward={reward:.4f} "
-                f"action={json.dumps(action_dict)}"
+        finally:
+            log_end(
+                success=success,
+                steps=steps_taken,
+                score=score,
+                rewards=rewards,
             )
-
-        # [END] log
-        episode_score = (
-            sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
-        )
-        print(
-            f"[END] task_id={task_id} "
-            f"steps={step_num} "
-            f"episode_score={episode_score:.4f}"
-        )
-
-        all_results.append({
-            "task_id": task_id,
-            "episode_score": round(episode_score, 4),
-            "steps": step_num,
-            "step_rewards": [round(r, 4) for r in step_rewards],
-        })
-
-    # Summary
-    overall = (
-        sum(r["episode_score"] for r in all_results) / len(all_results)
-        if all_results else 0.0
-    )
-    print(f"\nOverall score: {overall:.4f}")
-    print(f"Model: {MODEL_NAME}")
-    print(f"API: {API_BASE_URL}")
-
-    # Save results
-    output_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "baseline_results.json",
-    )
-    with open(output_path, "w") as f:
-        json.dump({
-            "model": MODEL_NAME,
-            "api_base_url": API_BASE_URL,
-            "seed": seed,
-            "results": all_results,
-            "overall_score": round(overall, 4),
-        }, f, indent=2)
 
     env_client.close()
 
