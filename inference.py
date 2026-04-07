@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026. Licensed under the BSD-style license.
-# Support Triage Environment — Baseline Inference Script (Root-level)
-
 """
-Baseline inference script that runs an LLM agent against all 3 tasks.
+Baseline inference script for Support Triage Environment.
+Follows the OpenEnv Hackathon x Scaler School of Technology required format.
 
-Uses the OpenAI API client (compatible with OpenAI, Azure OpenAI, and
-any OpenAI-compatible endpoint). Reads credentials from environment
-variables.
+Required env vars:
+    API_BASE_URL  — The API endpoint for the LLM
+    MODEL_NAME    — The model identifier to use for inference
+    HF_TOKEN      — Your Hugging Face / API key
 
-Usage:
-    OPENAI_API_KEY=sk-... python inference.py
-    OPENAI_API_KEY=sk-... python inference.py --model gpt-4o-mini
-    OPENAI_API_KEY=sk-... python inference.py --mode remote --base-url http://localhost:8000
+Emits structured stdout logs: [START], [STEP], [END]
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-# Ensure repo root is on path for imports
+# Ensure repo root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from openai import OpenAI
 
 from models import (
     Category,
@@ -41,24 +38,25 @@ from client import SupportTriageClient
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OpenAI client initialization
+# Configuration from environment variables
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_openai_client():
-    """Initialize OpenAI client from environment variables."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        print("ERROR: openai package not installed. Run: pip install openai")
-        sys.exit(1)
+API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("WARNING: OPENAI_API_KEY not set. Running in dummy mode.")
-        return None
+# Optional — for from_docker_image() usage
+LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
 
-    base_url = os.environ.get("OPENAI_BASE_URL", None)
-    return OpenAI(api_key=api_key, base_url=base_url)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenAI client configured via the required variables
+# ─────────────────────────────────────────────────────────────────────────────
+
+client = OpenAI(
+    base_url=API_BASE_URL,
+    api_key=HF_TOKEN or "dummy-key",
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -66,7 +64,6 @@ def get_openai_client():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_system_prompt(task_instructions: str) -> str:
-    """Build the system prompt for the LLM agent."""
     return f"""You are an AI agent performing customer support ticket triage.
 
 {task_instructions}
@@ -94,27 +91,22 @@ Example (Task 3):
 
 
 def build_ticket_prompt(obs: TriageObservation) -> str:
-    """Build the user prompt with the current ticket."""
     ticket = obs.ticket
     if not ticket:
         return "No ticket available."
-
     return f"""TICKET TO TRIAGE:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ID:          {ticket.ticket_id}
-Subject:     {ticket.subject}
-From:        {ticket.customer_name} ({ticket.customer_tier} tier)
-Channel:     {ticket.channel}
-Timestamp:   {ticket.timestamp}
-Prev Tickets: {ticket.previous_tickets}
+ID: {ticket.ticket_id}
+Subject: {ticket.subject}
+From: {ticket.customer_name} ({ticket.customer_tier} tier)
+Channel: {ticket.channel}
+Timestamp: {ticket.timestamp}
+Previous Tickets: {ticket.previous_tickets}
 Account Age: {ticket.account_age_days} days
 Attachments: {"Yes" if ticket.has_attachments else "No"}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{ticket.body}
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Respond with ONLY a JSON object containing your triage action.
-Tickets remaining: {obs.tickets_remaining}"""
+{ticket.body}
+
+Respond with ONLY a JSON object. Tickets remaining: {obs.tickets_remaining}"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,10 +114,7 @@ Tickets remaining: {obs.tickets_remaining}"""
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_llm_response(response_text: str) -> Dict[str, Any]:
-    """Parse the LLM response into a dict, handling common format issues."""
     text = response_text.strip()
-
-    # Strip markdown code fences if present
     if text.startswith("```"):
         lines = text.split("\n")
         if lines[0].startswith("```"):
@@ -133,124 +122,71 @@ def parse_llm_response(response_text: str) -> Dict[str, Any]:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-        if json_match:
+        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+        if match:
             try:
-                return json.loads(json_match.group())
+                return json.loads(match.group())
             except json.JSONDecodeError:
                 pass
-
-    print(f"  WARNING: Could not parse LLM response: {text[:100]}...")
     return {}
 
 
 def dict_to_action(data: Dict[str, Any]) -> TriageAction:
-    """Convert a parsed dict to a TriageAction, handling enum conversion."""
     clean = {}
+    enum_map = {
+        "priority": Priority,
+        "category": Category,
+        "sentiment": Sentiment,
+        "assigned_team": Team,
+        "decision": ReviewDecision,
+    }
     for key, value in data.items():
         if value is None:
             continue
-        if key == "priority" and isinstance(value, str):
+        if key in enum_map and isinstance(value, str):
             try:
-                clean[key] = Priority(value)
-            except ValueError:
-                pass
-        elif key == "category" and isinstance(value, str):
-            try:
-                clean[key] = Category(value)
-            except ValueError:
-                pass
-        elif key == "sentiment" and isinstance(value, str):
-            try:
-                clean[key] = Sentiment(value)
-            except ValueError:
-                pass
-        elif key == "assigned_team" and isinstance(value, str):
-            try:
-                clean[key] = Team(value)
-            except ValueError:
-                pass
-        elif key == "decision" and isinstance(value, str):
-            try:
-                clean[key] = ReviewDecision(value)
+                clean[key] = enum_map[key](value)
             except ValueError:
                 pass
         elif key in ("draft_response", "escalation_reason"):
             clean[key] = str(value)
-
     return TriageAction(**clean)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dummy agent (no API key)
+# Main inference loop with structured [START]/[STEP]/[END] logging
 # ─────────────────────────────────────────────────────────────────────────────
 
-def dummy_action(task_id: str) -> TriageAction:
-    """Generate a reasonable dummy action when no API key is available."""
-    if task_id == "task_1":
-        return TriageAction(priority=Priority.P2_MEDIUM)
-    elif task_id == "task_2":
-        return TriageAction(
-            priority=Priority.P2_MEDIUM,
-            category=Category.TECHNICAL,
-            sentiment=Sentiment.NEUTRAL,
-            assigned_team=Team.ENGINEERING,
-        )
-    else:
-        return TriageAction(
-            priority=Priority.P2_MEDIUM,
-            category=Category.TECHNICAL,
-            sentiment=Sentiment.NEUTRAL,
-            assigned_team=Team.ENGINEERING,
-            decision=ReviewDecision.RESPOND,
-            draft_response="Thank you for reaching out. We are investigating your issue and will follow up shortly.",
-            escalation_reason=None,
-        )
+def main():
+    # Initialize environment client (local mode — runs in-process)
+    env_client = SupportTriageClient.local()
 
+    tasks = ["task_1", "task_2", "task_3"]
+    seed = 42
+    all_results = []
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Episode runner
-# ─────────────────────────────────────────────────────────────────────────────
+    for task_id in tasks:
+        # Reset environment
+        obs = env_client.reset(task_id=task_id, seed=seed)
+        system_prompt = build_system_prompt(obs.task_instructions)
 
-def run_episode(
-    client: SupportTriageClient,
-    openai_client: Any,
-    task_id: str,
-    seed: int = 42,
-    model: str = "gpt-4o-mini",
-    verbose: bool = True,
-) -> Dict[str, Any]:
-    """Run a single episode (one task, all tickets)."""
-    if verbose:
-        print(f"\n{'='*60}")
-        print(f"  TASK: {task_id} | Model: {model} | Seed: {seed}")
-        print(f"{'='*60}")
+        # [START] log
+        print(f"[START] task_id={task_id} seed={seed}")
 
-    obs = client.reset(task_id=task_id, seed=seed)
-    system_prompt = build_system_prompt(obs.task_instructions)
+        step_num = 0
+        step_rewards: List[float] = []
 
-    step_rewards: List[float] = []
-    step_count = 0
-    start_time = time.time()
+        while not obs.done:
+            step_num += 1
+            ticket_prompt = build_ticket_prompt(obs)
 
-    while not obs.done:
-        step_count += 1
-        ticket_prompt = build_ticket_prompt(obs)
-
-        if verbose:
-            ticket = obs.ticket
-            print(f"\n  Step {step_count}: Ticket {ticket.ticket_id if ticket else 'N/A'}")
-            print(f"  Subject: {ticket.subject[:60] if ticket else 'N/A'}...")
-
-        if openai_client is not None:
-            # Use LLM
+            # Call LLM via OpenAI client
             try:
-                completion = openai_client.chat.completions.create(
-                    model=model,
+                completion = client.chat.completions.create(
+                    model=MODEL_NAME,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": ticket_prompt},
@@ -260,130 +196,50 @@ def run_episode(
                 )
                 response_text = completion.choices[0].message.content or ""
             except Exception as e:
-                print(f"  ERROR calling LLM: {e}")
+                print(f"[STEP] step={step_num} error=\"{e}\"")
                 response_text = "{}"
 
+            # Parse response and step
             parsed = parse_llm_response(response_text)
             action = dict_to_action(parsed)
-        else:
-            # Dummy mode
-            action = dummy_action(task_id)
+            obs = env_client.step(action)
 
-        if verbose:
-            action_summary = action.model_dump(exclude_none=True)
-            print(f"  Action: {json.dumps(action_summary, indent=2)[:200]}")
+            reward = obs.reward or 0.0
+            step_rewards.append(reward)
 
-        obs = client.step(action)
-        step_rewards.append(obs.reward or 0.0)
+            # [STEP] log
+            action_dict = action.model_dump(exclude_none=True)
+            print(
+                f"[STEP] task_id={task_id} step={step_num} "
+                f"reward={reward:.4f} "
+                f"action={json.dumps(action_dict)}"
+            )
 
-        if verbose:
-            print(f"  Reward: {obs.reward:.4f}")
-            if obs.step_feedback:
-                print(f"  Feedback: {obs.step_feedback[:100]}")
-
-    elapsed = time.time() - start_time
-    episode_score = (
-        sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
-    )
-
-    if verbose:
-        print(f"\n  {'─'*50}")
-        print(f"  Episode Score: {episode_score:.2%}")
-        print(f"  Steps: {step_count} | Time: {elapsed:.1f}s")
-        print(f"  Step Rewards: {[f'{r:.3f}' for r in step_rewards]}")
-
-    return {
-        "task_id": task_id,
-        "model": model,
-        "seed": seed,
-        "episode_score": round(episode_score, 4),
-        "step_rewards": [round(r, 4) for r in step_rewards],
-        "step_count": step_count,
-        "elapsed_seconds": round(elapsed, 2),
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Baseline inference for Support Triage Environment"
-    )
-    parser.add_argument(
-        "--mode", choices=["local", "remote"], default="local",
-        help="Run locally (in-process) or connect to a server.",
-    )
-    parser.add_argument(
-        "--base-url", default="http://localhost:8000",
-        help="Server URL for remote mode.",
-    )
-    parser.add_argument(
-        "--model", default="gpt-4o-mini",
-        help="OpenAI model to use.",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed for reproducibility.",
-    )
-    parser.add_argument(
-        "--tasks", nargs="+", default=["task_1", "task_2", "task_3"],
-        help="Tasks to run.",
-    )
-    parser.add_argument(
-        "--quiet", action="store_true",
-        help="Minimal output.",
-    )
-    args = parser.parse_args()
-
-    # Initialize client
-    if args.mode == "local":
-        client = SupportTriageClient.local()
-    else:
-        client = SupportTriageClient.remote(args.base_url)
-
-    # Initialize OpenAI client (None if no API key)
-    openai_client = get_openai_client()
-
-    mode_label = "LLM" if openai_client else "dummy"
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║  Support Triage Environment — Baseline Inference        ║")
-    print("╚══════════════════════════════════════════════════════════╝")
-    print(f"  Mode:   {args.mode}")
-    print(f"  Agent:  {mode_label}")
-    print(f"  Model:  {args.model}")
-    print(f"  Seed:   {args.seed}")
-    print(f"  Tasks:  {args.tasks}")
-
-    # Run all tasks
-    results = []
-    for task_id in args.tasks:
-        result = run_episode(
-            client=client,
-            openai_client=openai_client,
-            task_id=task_id,
-            seed=args.seed,
-            model=args.model,
-            verbose=not args.quiet,
+        # [END] log
+        episode_score = (
+            sum(step_rewards) / len(step_rewards) if step_rewards else 0.0
         )
-        results.append(result)
+        print(
+            f"[END] task_id={task_id} "
+            f"steps={step_num} "
+            f"episode_score={episode_score:.4f}"
+        )
+
+        all_results.append({
+            "task_id": task_id,
+            "episode_score": round(episode_score, 4),
+            "steps": step_num,
+            "step_rewards": [round(r, 4) for r in step_rewards],
+        })
 
     # Summary
-    print(f"\n{'='*60}")
-    print("  BASELINE RESULTS SUMMARY")
-    print(f"{'='*60}")
-    for r in results:
-        print(f"  {r['task_id']:8s} → Score: {r['episode_score']:.2%}  "
-              f"({r['step_count']} steps, {r['elapsed_seconds']:.1f}s)")
-
     overall = (
-        sum(r["episode_score"] for r in results) / len(results)
-        if results else 0.0
+        sum(r["episode_score"] for r in all_results) / len(all_results)
+        if all_results else 0.0
     )
-    print(f"  {'─'*50}")
-    print(f"  Overall:  {overall:.2%}")
-    print(f"{'='*60}")
+    print(f"\nOverall score: {overall:.4f}")
+    print(f"Model: {MODEL_NAME}")
+    print(f"API: {API_BASE_URL}")
 
     # Save results
     output_path = os.path.join(
@@ -391,14 +247,15 @@ def main():
         "baseline_results.json",
     )
     with open(output_path, "w") as f:
-        json.dump(
-            {"model": args.model, "seed": args.seed, "results": results,
-             "overall_score": round(overall, 4)},
-            f, indent=2,
-        )
-    print(f"\n  Results saved to: {output_path}")
+        json.dump({
+            "model": MODEL_NAME,
+            "api_base_url": API_BASE_URL,
+            "seed": seed,
+            "results": all_results,
+            "overall_score": round(overall, 4),
+        }, f, indent=2)
 
-    client.close()
+    env_client.close()
 
 
 if __name__ == "__main__":
