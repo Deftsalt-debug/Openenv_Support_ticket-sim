@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026. Licensed under the BSD-style license.
-# Support Triage Environment — Baseline Inference Script
+# Support Triage Environment — Baseline Inference Script (Root-level)
 
 """
 Baseline inference script that runs an LLM agent against all 3 tasks.
@@ -10,14 +10,9 @@ any OpenAI-compatible endpoint). Reads credentials from environment
 variables.
 
 Usage:
-    # With a running server:
-    OPENAI_API_KEY=sk-... python baseline/inference.py --mode remote --base-url http://localhost:8000
-
-    # Local (in-process, no server needed):
-    OPENAI_API_KEY=sk-... python baseline/inference.py --mode local
-
-    # Specify model:
-    OPENAI_API_KEY=sk-... python baseline/inference.py --model gpt-4o-mini
+    OPENAI_API_KEY=sk-... python inference.py
+    OPENAI_API_KEY=sk-... python inference.py --model gpt-4o-mini
+    OPENAI_API_KEY=sk-... python inference.py --mode remote --base-url http://localhost:8000
 """
 
 from __future__ import annotations
@@ -25,12 +20,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-# Add parent to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure repo root is on path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models import (
     Category,
@@ -44,6 +40,10 @@ from models import (
 from client import SupportTriageClient
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenAI client initialization
+# ─────────────────────────────────────────────────────────────────────────────
+
 def get_openai_client():
     """Initialize OpenAI client from environment variables."""
     try:
@@ -54,12 +54,16 @@ def get_openai_client():
 
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        print("ERROR: OPENAI_API_KEY environment variable not set.")
-        sys.exit(1)
+        print("WARNING: OPENAI_API_KEY not set. Running in dummy mode.")
+        return None
 
     base_url = os.environ.get("OPENAI_BASE_URL", None)
     return OpenAI(api_key=api_key, base_url=base_url)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prompt construction
+# ─────────────────────────────────────────────────────────────────────────────
 
 def build_system_prompt(task_instructions: str) -> str:
     """Build the system prompt for the LLM agent."""
@@ -113,6 +117,10 @@ Respond with ONLY a JSON object containing your triage action.
 Tickets remaining: {obs.tickets_remaining}"""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Response parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_llm_response(response_text: str) -> Dict[str, Any]:
     """Parse the LLM response into a dict, handling common format issues."""
     text = response_text.strip()
@@ -120,7 +128,6 @@ def parse_llm_response(response_text: str) -> Dict[str, Any]:
     # Strip markdown code fences if present
     if text.startswith("```"):
         lines = text.split("\n")
-        # Remove first and last lines if they are code fences
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
@@ -130,8 +137,6 @@ def parse_llm_response(response_text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Try to find JSON in the response
-        import re
         json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
         if json_match:
             try:
@@ -139,7 +144,6 @@ def parse_llm_response(response_text: str) -> Dict[str, Any]:
             except json.JSONDecodeError:
                 pass
 
-    # Return empty dict as fallback
     print(f"  WARNING: Could not parse LLM response: {text[:100]}...")
     return {}
 
@@ -181,6 +185,37 @@ def dict_to_action(data: Dict[str, Any]) -> TriageAction:
     return TriageAction(**clean)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dummy agent (no API key)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def dummy_action(task_id: str) -> TriageAction:
+    """Generate a reasonable dummy action when no API key is available."""
+    if task_id == "task_1":
+        return TriageAction(priority=Priority.P2_MEDIUM)
+    elif task_id == "task_2":
+        return TriageAction(
+            priority=Priority.P2_MEDIUM,
+            category=Category.TECHNICAL,
+            sentiment=Sentiment.NEUTRAL,
+            assigned_team=Team.ENGINEERING,
+        )
+    else:
+        return TriageAction(
+            priority=Priority.P2_MEDIUM,
+            category=Category.TECHNICAL,
+            sentiment=Sentiment.NEUTRAL,
+            assigned_team=Team.ENGINEERING,
+            decision=ReviewDecision.RESPOND,
+            draft_response="Thank you for reaching out. We are investigating your issue and will follow up shortly.",
+            escalation_reason=None,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Episode runner
+# ─────────────────────────────────────────────────────────────────────────────
+
 def run_episode(
     client: SupportTriageClient,
     openai_client: Any,
@@ -189,22 +224,16 @@ def run_episode(
     model: str = "gpt-4o-mini",
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Run a single episode (one task, all tickets).
-
-    Returns:
-        Dict with episode results including final score.
-    """
+    """Run a single episode (one task, all tickets)."""
     if verbose:
         print(f"\n{'='*60}")
         print(f"  TASK: {task_id} | Model: {model} | Seed: {seed}")
         print(f"{'='*60}")
 
-    # Reset
     obs = client.reset(task_id=task_id, seed=seed)
     system_prompt = build_system_prompt(obs.task_instructions)
 
-    step_rewards = []
+    step_rewards: List[float] = []
     step_count = 0
     start_time = time.time()
 
@@ -217,31 +246,33 @@ def run_episode(
             print(f"\n  Step {step_count}: Ticket {ticket.ticket_id if ticket else 'N/A'}")
             print(f"  Subject: {ticket.subject[:60] if ticket else 'N/A'}...")
 
-        # Call LLM
-        try:
-            completion = openai_client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": ticket_prompt},
-                ],
-                temperature=0.0,
-                max_tokens=500,
-            )
-            response_text = completion.choices[0].message.content or ""
-        except Exception as e:
-            print(f"  ERROR calling LLM: {e}")
-            response_text = "{}"
+        if openai_client is not None:
+            # Use LLM
+            try:
+                completion = openai_client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": ticket_prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=500,
+                )
+                response_text = completion.choices[0].message.content or ""
+            except Exception as e:
+                print(f"  ERROR calling LLM: {e}")
+                response_text = "{}"
 
-        # Parse and create action
-        parsed = parse_llm_response(response_text)
-        action = dict_to_action(parsed)
+            parsed = parse_llm_response(response_text)
+            action = dict_to_action(parsed)
+        else:
+            # Dummy mode
+            action = dummy_action(task_id)
 
         if verbose:
             action_summary = action.model_dump(exclude_none=True)
             print(f"  Action: {json.dumps(action_summary, indent=2)[:200]}")
 
-        # Step
         obs = client.step(action)
         step_rewards.append(obs.reward or 0.0)
 
@@ -271,6 +302,10 @@ def run_episode(
         "elapsed_seconds": round(elapsed, 2),
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -308,16 +343,18 @@ def main():
     else:
         client = SupportTriageClient.remote(args.base_url)
 
-    # Initialize OpenAI client
+    # Initialize OpenAI client (None if no API key)
     openai_client = get_openai_client()
 
+    mode_label = "LLM" if openai_client else "dummy"
     print("╔══════════════════════════════════════════════════════════╗")
     print("║  Support Triage Environment — Baseline Inference        ║")
     print("╚══════════════════════════════════════════════════════════╝")
-    print(f"  Mode:  {args.mode}")
-    print(f"  Model: {args.model}")
-    print(f"  Seed:  {args.seed}")
-    print(f"  Tasks: {args.tasks}")
+    print(f"  Mode:   {args.mode}")
+    print(f"  Agent:  {mode_label}")
+    print(f"  Model:  {args.model}")
+    print(f"  Seed:   {args.seed}")
+    print(f"  Tasks:  {args.tasks}")
 
     # Run all tasks
     results = []
@@ -362,7 +399,6 @@ def main():
     print(f"\n  Results saved to: {output_path}")
 
     client.close()
-    return results
 
 
 if __name__ == "__main__":
