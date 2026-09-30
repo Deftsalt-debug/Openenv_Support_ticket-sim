@@ -11,40 +11,31 @@ pinned: false
 ---
 # 🎫 Support Triage Environment
 
-An OpenEnv-compatible reinforcement learning environment that simulates **real-world customer support ticket triage** — the process of classifying, routing, and responding to incoming support requests. Designed for training and evaluating AI agents on a task humans perform every day in every SaaS company.
+A support-ticket simulation for trying out AI agents. An agent reads a ticket,
+chooses its labels and routing, and, in the harder task, drafts a reply. The
+environment scores the action and moves to the next ticket.
 
----
+There are 16 synthetic ticket templates, from production outages to documentation
+typos. Their expected labels make runs easy to compare with a fixed seed. This is
+a graded exercise, not a real support queue or a measure of how well an agent
+would handle every customer.
 
-## Motivation
-
-Customer support triage is one of the most common, high-volume knowledge work tasks in the world. Every company with a support queue needs agents (human or AI) that can:
-
-1. **Assess urgency** — Is this a production outage or a typo report?
-2. **Classify the issue** — Billing? Security breach? Feature request?
-3. **Read the customer** — Are they angry, confused, or just asking a question?
-4. **Route correctly** — Engineering, billing ops, or customer success?
-5. **Respond appropriately** — Draft a message that matches tone and provides next steps.
-6. **Decide disposition** — Respond directly, escalate, or auto-resolve?
-
-This environment provides a structured, graded simulation of this workflow with 16 realistic ticket templates spanning P0 production outages to P3 documentation typos, complete with deterministic ground-truth labels for fully programmatic evaluation.
-
----
+The three tasks build up from priority classification to routing and response
+drafting. The models, scoring rules and client examples are below.
 
 ## Environment Overview
 
 | Property              | Value                                    |
 |-----------------------|------------------------------------------|
-| **Interface**         | OpenEnv 0.1 (step / reset / state)       |
+| **Interface**         | OpenEnv step / reset / state API       |
 | **Action Type**       | `TriageAction` (Pydantic model)          |
 | **Observation Type**  | `TriageObservation` (Pydantic model)     |
 | **State Type**        | `TriageState` (Pydantic model)           |
 | **Reward Range**      | `[0.0, 1.0]` per step                   |
-| **Tasks**             | 3 (easy → medium → hard)                |
-| **Ticket Templates**  | 16 realistic scenarios                   |
+| **Tasks**             | 3 (priority → labels → full triage)                |
+| **Ticket Templates**  | 16 synthetic scenarios                   |
 | **Grading**           | Fully programmatic, deterministic        |
 | **Deployment**        | Docker + Hugging Face Spaces             |
-
----
 
 ## Action Space
 
@@ -67,8 +58,6 @@ TriageAction:
 **Task 2 (Medium):** `priority` + `category` + `sentiment` + `assigned_team`.
 **Task 3 (Hard):** All 7 fields including `draft_response` and `escalation_reason`.
 
----
-
 ## Observation Space
 
 After each `step()` or `reset()`, the environment returns a `TriageObservation`:
@@ -88,8 +77,6 @@ TriageObservation:
 
 Each `TicketData` contains: `ticket_id`, `subject`, `body`, `customer_name`, `customer_tier` (free/pro/enterprise), `timestamp`, `channel`, `previous_tickets`, `account_age_days`, `has_attachments`.
 
----
-
 ## Task Descriptions
 
 ### Task 1 — Priority Classification (Easy)
@@ -97,23 +84,18 @@ Each `TicketData` contains: `ticket_id`, `subject`, `body`, `customer_name`, `cu
 - **Tickets:** 5 per episode.
 - **Evaluated fields:** `priority` only.
 - **Signals:** Urgency language, customer tier, scope of impact.
-- **Expected difficulty:** Straightforward — clear priority signals in each ticket.
 
 ### Task 2 — Multi-Label Triage (Medium)
 - **Objective:** Classify priority, category, sentiment, and route to the correct team.
 - **Tickets:** 8 per episode.
 - **Evaluated fields:** `priority`, `category`, `sentiment`, `assigned_team`.
 - **Signals:** Must cross-reference category with routing table, detect tone.
-- **Expected difficulty:** Moderate — requires understanding multiple dimensions simultaneously.
 
 ### Task 3 — Full Triage with Response Drafting (Hard)
 - **Objective:** Complete triage including a professional draft response and escalation decision.
 - **Tickets:** 10 per episode (includes ambiguous/tricky scenarios).
 - **Evaluated fields:** All 7 fields.
 - **Signals:** Escalation criteria (legal threats, revenue impact, security breaches), response quality (personalization, required elements, tone matching).
-- **Expected difficulty:** Hard — requires nuanced judgment, empathetic writing, and correct disposition.
-
----
 
 ## Reward Function
 
@@ -140,25 +122,21 @@ Rewards are computed **per-step** (not just end-of-episode), providing continuou
 | draft_response     | —      | —      | 20%    |
 | escalation_reason  | —      | —      | 10%    |
 
----
-
 ## Setup & Usage
-
-### Prerequisites
-
-- Python 3.10+
-- Docker (for containerized deployment)
 
 ### Install
 
-```bash
-# Clone the repository
-git clone <repo-url>
-cd support_triage_env
+Use Python 3.10 or newer. From the project folder:
 
-# Install dependencies
-pip install -e ".[all]"
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[all]"
 ```
+
+On Windows PowerShell, activate with `.\.venv\Scripts\Activate.ps1` instead.
+The `all` extra includes the test dependencies and optional OpenAI baseline.
+Docker is only needed if you choose the container route below.
 
 ### Run the Server
 
@@ -175,7 +153,7 @@ docker run -p 8000:8000 support-triage-env:latest
 
 ```python
 from client import SupportTriageClient
-from models import TriageAction, Priority, Category, Sentiment, Team
+from models import TriageAction, Priority
 
 # Local mode (no server needed)
 client = SupportTriageClient.local()
@@ -199,40 +177,32 @@ state = client.state()
 print(f"Steps: {state.step_count}, Score: {state.cumulative_reward:.2f}")
 ```
 
-### Run Baseline Inference
+### Run the optional baseline
+
+With `OPENAI_API_KEY` already set in your environment, run from the project root:
 
 ```bash
-# Requires OPENAI_API_KEY environment variable
-OPENAI_API_KEY=sk-... python baseline/inference.py --mode local --model gpt-4o-mini
+python -m baseline.inference --mode local --model gpt-4o-mini
 ```
 
-### Run Tests
+This calls the OpenAI API. The local client and tests don't need that key.
+Record the model, seed and output when comparing scores. The earlier approximate
+score table wasn't backed by a saved run in this checkout, so it has been removed.
+
+### Run tests
 
 ```bash
-cd support_triage_env
-pytest tests/ -v
+python -m pytest tests/ -v
 ```
 
----
-
-## Baseline Scores
-
-Scores below are from `gpt-4o-mini` with `temperature=0.0` and `seed=42`:
-
-| Task   | Difficulty | Score  | Notes                                       |
-|--------|------------|--------|---------------------------------------------|
-| task_1 | Easy       | ~85%+  | Priority classification is well-suited to LLMs |
-| task_2 | Medium     | ~70%+  | Multi-label requires cross-referencing       |
-| task_3 | Hard       | ~55%+  | Response drafting + escalation is challenging |
-
-*(Exact scores depend on model version and API behavior. Run `baseline/inference.py` for reproducible numbers.)*
-
----
+The review passed 72 tests, covering the environment and HTTP/WebSocket behavior.
+The graders check labels and rule-based response features; a high score isn't a
+guarantee that a reply is appropriate for a real customer.
 
 ## Project Structure
 
 ```
-support_triage_env/
+project-root/
 ├── openenv.yaml              # OpenEnv metadata specification
 ├── pyproject.toml             # Python package configuration
 ├── Dockerfile                 # Root Dockerfile (build from project root)
@@ -242,7 +212,7 @@ support_triage_env/
 ├── client.py                  # HTTP + local client implementation
 ├── data/
 │   ├── __init__.py
-│   └── tickets.py             # 16 realistic ticket templates + generator
+│   └── tickets.py             # 16 synthetic ticket templates + generator
 ├── tasks/
 │   ├── __init__.py
 │   ├── task_definitions.py    # 3 task specs (easy → medium → hard)
@@ -257,10 +227,9 @@ support_triage_env/
 │   ├── __init__.py
 │   └── inference.py           # OpenAI API baseline agent
 └── tests/
-    └── test_environment.py    # Comprehensive test suite
+    ├── test_environment.py    # Environment and grader checks
+    └── test_api.py            # HTTP and WebSocket regressions
 ```
-
----
 
 ## API Reference
 
@@ -282,8 +251,6 @@ Connect to `ws://host:8000/ws` for persistent sessions. Send JSON messages:
 {"type": "step", "action": {"priority": "P1_HIGH"}}
 {"type": "state"}
 ```
-
----
 
 ## License
 

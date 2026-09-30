@@ -146,16 +146,13 @@ async def reset(request: Request):
     Returns the initial observation with the first ticket.
     """
     try:
-        # Parse body — accept empty POST, partial JSON, or full JSON
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-
-        task_id = body.get("task_id", "task_1") if isinstance(body, dict) else "task_1"
-        seed = body.get("seed", 42) if isinstance(body, dict) else 42
-
-        obs = _default_env.reset(task_id=str(task_id), seed=int(seed))
+        # An empty POST uses defaults; malformed JSON must not restart an episode.
+        raw = await request.body()
+        body = json.loads(raw) if raw else {}
+        if not isinstance(body, dict):
+            raise ValueError("Reset body must be a JSON object.")
+        options = ResetRequest.model_validate(body)
+        obs = _default_env.reset(task_id=options.task_id, seed=options.seed)
         obs_dict = obs.model_dump()
 
         # Return observation at top level (OpenEnv spec format)
@@ -167,9 +164,14 @@ async def reset(request: Request):
             "done": obs.done,
             "info": obs.metadata,
         })
-    except Exception as e:
+    except (ValueError, KeyError) as e:
         return JSONResponse(
             status_code=400,
+            content={"error": str(e)},
+        )
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
             content={"error": str(e), "traceback": traceback.format_exc()},
         )
 
@@ -191,12 +193,10 @@ async def step(request: Request):
             )
 
         # Accept both {"action": {...}} and direct action fields
-        if "action" in body and isinstance(body["action"], dict):
-            action_data = body["action"]
-        else:
-            action_data = body
-
-        action = TriageAction(**action_data)
+        if not isinstance(body, dict):
+            raise ValueError("Step body must be a JSON object.")
+        action_data = body.get("action", body)
+        action = TriageAction.model_validate(action_data)
         obs = _default_env.step(action=action)
         obs_dict = obs.model_dump()
 
@@ -207,7 +207,7 @@ async def step(request: Request):
             "done": obs.done,
             "info": obs.metadata,
         })
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         return JSONResponse(
             status_code=400,
             content={"error": str(e)},
@@ -257,13 +257,18 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
+            if not isinstance(msg, dict):
+                await websocket.send_json({"type": "error", "error": "Message must be a JSON object."})
+                continue
+
             msg_type = msg.get("type", "")
 
             if msg_type == "reset":
                 task_id = msg.get("task_id", "task_1")
                 seed = msg.get("seed", 42)
                 try:
-                    obs = env.reset(task_id=task_id, seed=seed)
+                    options = ResetRequest(task_id=task_id, seed=seed)
+                    obs = env.reset(task_id=options.task_id, seed=options.seed)
                     obs_dict = obs.model_dump()
                     await websocket.send_json({
                         "type": "reset_result",
@@ -282,7 +287,7 @@ async def websocket_endpoint(websocket: WebSocket):
             elif msg_type == "step":
                 action_data = msg.get("action", {})
                 try:
-                    action = TriageAction(**action_data)
+                    action = TriageAction.model_validate(action_data)
                     obs = env.step(action=action)
                     obs_dict = obs.model_dump()
                     await websocket.send_json({

@@ -325,7 +325,8 @@ def score_draft_response(
     scores.append(length_score)
 
     # 2. Name personalization
-    name_score = 1.0 if customer_name.lower().split()[0] in draft_lower else 0.3
+    name_parts = customer_name.lower().split()
+    name_score = 1.0 if name_parts and name_parts[0] in draft_lower else 0.3
     scores.append(name_score)
 
     # 3. Required elements coverage
