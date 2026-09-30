@@ -194,6 +194,17 @@ class TestDataGeneration:
 class TestGraders:
     """Test scoring functions for correctness and properties."""
 
+    @pytest.mark.parametrize("name", ["", "   "])
+    def test_response_without_customer_name(self, name):
+        ticket = generate_ticket_pool("task_3")[0]
+        result = grade_action(
+            TriageAction(draft_response="Thanks for letting us know. We are looking into this and will help you shortly."),
+            ticket.ground_truth,
+            "task_3",
+            customer_name=name,
+        )
+        assert 0.0 <= result.total_score <= 1.0
+
     # Priority scoring
     def test_priority_exact_match(self):
         assert score_priority(Priority.P0_CRITICAL, Priority.P0_CRITICAL) == 1.0
